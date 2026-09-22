@@ -47,7 +47,18 @@ const CHART_WIDTH = 1040;
 const CHART_HEIGHT = 240;
 const PAD = { top: 16, right: 12, bottom: 28, left: 56 };
 
-export function AdSpendTrendChart({ series }: { series: SpendSeries[] }) {
+// Default only used if a caller doesn't pass its own `money` formatter —
+// every current caller (app.ad-spend.tsx) does, so its real currency
+// (e.g. "Rs" for a PKR-denominated ad account) is what actually shows.
+const defaultMoney = (n: number) => "$" + n.toFixed(2);
+
+export function AdSpendTrendChart({
+  series,
+  money = defaultMoney,
+}: {
+  series: SpendSeries[];
+  money?: (n: number) => string;
+}) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
@@ -223,7 +234,7 @@ export function AdSpendTrendChart({ series }: { series: SpendSeries[] }) {
           <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3 }}>
             <span style={{ display: "inline-block", width: 10, height: 2, background: s.color }} />
             <Text as="span" variant="bodySm">
-              {s.label}: <Text as="span" fontWeight="semibold">{"$" + (s.points[activeIndex]?.spend ?? 0).toFixed(2)}</Text>
+              {s.label}: <Text as="span" fontWeight="semibold">{money(s.points[activeIndex]?.spend ?? 0)}</Text>
             </Text>
           </div>
         ))}
@@ -237,8 +248,10 @@ export function AdSpendTrendChart({ series }: { series: SpendSeries[] }) {
 // share instead of cost-category share.
 export function SpendMixBar({
   segments,
+  money = defaultMoney,
 }: {
   segments: Array<{ label: string; value: number; color: string }>;
+  money?: (n: number) => string;
 }) {
   const total = segments.reduce((s, seg) => s + Math.max(seg.value, 0), 0);
 
@@ -252,7 +265,7 @@ export function SpendMixBar({
               <div
                 key={seg.label}
                 style={{ width: `${(seg.value / total) * 100}%`, background: seg.color }}
-                title={`${seg.label}: $${seg.value.toFixed(2)}`}
+                title={`${seg.label}: ${money(seg.value)}`}
               />
             ))}
       </div>
@@ -263,7 +276,7 @@ export function SpendMixBar({
             <Text as="span" variant="bodySm" tone="subdued">
               {seg.label}{" "}
               <Text as="span" fontWeight="semibold" tone={undefined}>
-                {"$" + seg.value.toFixed(2)}
+                {money(seg.value)}
               </Text>{" "}
               · {total > 0 ? ((seg.value / total) * 100).toFixed(0) : "0"}%
             </Text>

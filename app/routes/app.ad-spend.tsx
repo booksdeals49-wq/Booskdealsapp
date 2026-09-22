@@ -8,7 +8,6 @@ import {
   FormLayout,
   TextField,
   Button,
-  ButtonGroup,
   BlockStack,
   InlineStack,
   Text,
@@ -43,6 +42,8 @@ import { IconBadge, SectionHeading } from "../components/StatTile";
 import { AdSpendTrendChart, SpendMixBar } from "../components/AdSpendVisuals";
 import { BRAND } from "../components/theme";
 import { encryptSecret, decryptSecret, encryptJson, decryptJson } from "../services/crypto.server";
+import { resolveDateRange } from "../utils/dateRange.server";
+import { DateRangePicker } from "../components/DateRangePicker";
 
 const PLATFORMS = ["meta", "google", "tiktok", "snapchat"] as const;
 type Platform = (typeof PLATFORMS)[number];
@@ -64,13 +65,7 @@ const PLATFORM_COLOR: Record<Platform, string> = {
   snapchat: "#4A6FA5",
 };
 
-const RANGE_OPTIONS = [7, 14, 30] as const;
-type RangeDays = (typeof RANGE_OPTIONS)[number];
-// Fetch a 60-day window (double the largest selectable range) so every
-// range option — including the max, 30 days — can show a real "vs previous
-// period" comparison instead of hiding it only for the widest filter.
-const FETCH_WINDOW_DAYS = 60;
-const CAMPAIGN_RANGE_KEYS = RANGE_OPTIONS.map(String);
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 type DailyPoint = { date: string; spend: number; impressions?: number; clicks?: number; revenue?: number };
 type CampaignRow = { campaign: string; spend: number; ctr: number | null; roas: number | null };
@@ -91,6 +86,12 @@ function campaignDisplayName(raw: string) {
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
+  const url = new URL(request.url);
+  // Same "?from=&to=" URL-param range every other report page uses —
+  // defaults to the last 30 days when neither is present. Replaces the old
+  // fixed-7/14/30-day toggle so any range (e.g. "1st of September till
+  // today") can be picked directly, not just three preset widths.
+  const range = resolveDateRange(url);
 
   const billingState = await getBillingState(shop);
   const tier = currentTier(billingState);
@@ -114,22 +115,28 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  // Ascending oldest -> newest date keys for the full fetch window, so the
-  // trend chart and the 7/14/30-day filter both have a continuous,
-  // zero-filled series to slice client-side without another server round
-  // trip.
+  // Ascending oldest -> newest date keys spanning the selected range, so
+  // the trend chart has a continuous, zero-filled series for exactly the
+  // days the user picked.
   const dateKeys: string[] = [];
-  for (let i = FETCH_WINDOW_DAYS - 1; i >= 0; i--) {
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() - i);
-    dateKeys.push(d.toISOString().slice(0, 10));
+  for (let t = range.from.getTime(); t < range.to.getTime(); t += DAY_MS) {
+    dateKeys.push(new Date(t).toISOString().slice(0, 10));
   }
-  const windowStart = new Date(dateKeys[0] + "T00:00:00.000Z");
 
-  const [rows, costSettingsHistory] = await Promise.all([
+  // An equal-length window immediately before the selected range, purely
+  // for the "vs previous period" comparison — same idea as every other
+  // page's own comparison, just totals-only (no daily breakdown needed).
+  const spanMs = range.to.getTime() - range.from.getTime();
+  const prevTo = range.from;
+  const prevFrom = new Date(range.from.getTime() - spanMs);
+
+  const [rows, prevRows, costSettingsHistory] = await Promise.all([
     prisma.adSpend.findMany({
-      where: { shop, date: { gte: windowStart } },
+      where: { shop, date: { gte: range.from, lt: range.to } },
       orderBy: { date: "asc" },
+    }),
+    prisma.adSpend.findMany({
+      where: { shop, date: { gte: prevFrom, lt: prevTo } },
     }),
     getCostSettingsHistory(shop),
   ]);
@@ -151,7 +158,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const p = r.platform as Platform;
     const dateKey = new Date(r.date).toISOString().slice(0, 10);
     const bucket = dailyTotals[p].get(dateKey);
-    if (!bucket) continue; // outside the loaded window
+    if (!bucket) continue; // shouldn't happen — row is already scoped to the range
     bucket.spend = round2(bucket.spend + r.spend);
     bucket.impressions = (bucket.impressions ?? 0) + (r.impressions ?? 0);
     bucket.clicks = (bucket.clicks ?? 0) + (r.clicks ?? 0);
@@ -165,18 +172,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     snapchat: dateKeys.map((dk) => dailyTotals.snapchat.get(dk)!),
   };
 
+  // Previous-period totals per platform, for the hero card's delta — just a
+  // sum, no daily breakdown needed since it's never charted.
+  const prevTotals: Record<Platform, number> = { meta: 0, google: 0, tiktok: 0, snapchat: 0 };
+  for (const r of prevRows as Array<{ platform: string; spend: number }>) {
+    if (!(PLATFORMS as readonly string[]).includes(r.platform)) continue;
+    const p = r.platform as Platform;
+    prevTotals[p] = round2(prevTotals[p] + r.spend);
+  }
+
   // Government tax on ad-platform transactions — one blended rate across
   // Meta/Google/TikTok/Snapchat combined (not per-platform), resolved per
   // row by that row's own date so a rate change never retroactively changes
-  // past tax. Bucketed by day, same shape as `daily`, so the client can
-  // slice/sum it for the 7/14/30-day filter exactly like spend. See
+  // past tax. Bucketed by day, same shape as `daily`. See
   // costSettingsResolver.ts's computeAdSpendTax.
   const dailyTaxMap = new Map<string, number>();
   for (const dk of dateKeys) dailyTaxMap.set(dk, 0);
   for (const r of rows as Array<{ platform: string; date: Date; spend: number }>) {
     if (!(PLATFORMS as readonly string[]).includes(r.platform)) continue;
     const dateKey = new Date(r.date).toISOString().slice(0, 10);
-    if (!dailyTaxMap.has(dateKey)) continue; // outside the loaded window
+    if (!dailyTaxMap.has(dateKey)) continue;
     const settings = resolveCostSettingsAt(costSettingsHistory, r.date);
     dailyTaxMap.set(
       dateKey,
@@ -185,15 +200,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
   const dailyTax = dateKeys.map((dk) => dailyTaxMap.get(dk)!);
 
-  function aggregateCampaigns(platform: Platform, rangeDateKeys: Set<string>): CampaignRow[] {
+  // Campaigns for the selected range only — `rows` is already scoped to it
+  // (the query above), so no more range-keyed maps to pick between.
+  function aggregateCampaigns(platform: Platform): CampaignRow[] {
     const totals = new Map<string, { spend: number; impressions: number; clicks: number; revenue: number }>();
     for (const r of rows as Array<{
       platform: string; date: Date; spend: number; campaign: string | null;
       impressions: number; clicks: number; revenue: number;
     }>) {
       if (r.platform !== platform) continue;
-      const dk = new Date(r.date).toISOString().slice(0, 10);
-      if (!rangeDateKeys.has(dk)) continue;
       const key = r.campaign && r.campaign.trim() ? r.campaign : "(Unlabeled)";
       const cur = totals.get(key) ?? { spend: 0, impressions: 0, clicks: 0, revenue: 0 };
       cur.spend += r.spend;
@@ -213,24 +228,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       .slice(0, 25);
   }
 
-  const campaignsByRange: Record<Platform, Record<string, CampaignRow[]>> = {
-    meta: {}, google: {}, tiktok: {}, snapchat: {},
+  const campaigns: Record<Platform, CampaignRow[]> = {
+    meta: aggregateCampaigns("meta"),
+    google: aggregateCampaigns("google"),
+    tiktok: aggregateCampaigns("tiktok"),
+    snapchat: aggregateCampaigns("snapchat"),
   };
-  for (const p of PLATFORMS) {
-    for (const n of RANGE_OPTIONS) {
-      const rangeSet = new Set(dateKeys.slice(-n));
-      campaignsByRange[p][String(n)] = aggregateCampaigns(p, rangeSet);
-    }
-  }
 
   return json({
     connections: byPlatform,
     daily,
     dailyTax,
     currentTaxPercent,
-    campaignsByRange,
+    campaigns,
+    prevTotals,
     unlocked,
     tier,
+    range,
   });
 };
 
@@ -489,14 +503,13 @@ function roasBadgeTone(roas: number): "success" | "info" | "attention" {
 }
 
 export default function AdSpend() {
-  const { connections, daily, dailyTax, currentTaxPercent, campaignsByRange, unlocked, tier } =
+  const { connections, daily, dailyTax, currentTaxPercent, campaigns, prevTotals, unlocked, tier, range } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const busy = navigation.state === "submitting";
 
   const [selected, setSelected] = useState(0);
-  const [range, setRange] = useState<RangeDays>(30);
   const platform = PLATFORMS[selected];
   const platformUnlocked = (unlocked as readonly string[]).includes(platform);
 
@@ -517,35 +530,27 @@ export default function AdSpend() {
   }));
 
   const view = useMemo(() => {
-    const curByPlatform: Record<Platform, DailyPoint[]> = {} as any;
-    const prevByPlatform: Record<Platform, DailyPoint[]> = {} as any;
-    for (const p of PLATFORMS) {
-      const arr = daily[p];
-      curByPlatform[p] = arr.slice(arr.length - range);
-      prevByPlatform[p] = arr.slice(Math.max(0, arr.length - 2 * range), arr.length - range);
-    }
-    const curTotals = PLATFORMS.map((p) => sum(curByPlatform[p]));
-    const prevTotals = PLATFORMS.map((p) => sum(prevByPlatform[p]));
+    const curTotals = PLATFORMS.map((p) => sum(daily[p]));
     const combinedCur = round2(curTotals.reduce((a, b) => a + b, 0));
-    const combinedPrev = round2(prevTotals.reduce((a, b) => a + b, 0));
+    const combinedPrev = round2(PLATFORMS.reduce((s, p) => s + (prevTotals[p] ?? 0), 0));
     const deltaPct = combinedPrev > 0 ? ((combinedCur - combinedPrev) / combinedPrev) * 100 : null;
     const connectedCount = PLATFORMS.filter((p) => connections[p].connected).length;
 
-    const metaImpr = curByPlatform.meta.reduce((s, p) => s + (p.impressions ?? 0), 0);
-    const metaClicks = curByPlatform.meta.reduce((s, p) => s + (p.clicks ?? 0), 0);
-    const metaRevenue = curByPlatform.meta.reduce((s, p) => s + (p.revenue ?? 0), 0);
+    const metaImpr = daily.meta.reduce((s, p) => s + (p.impressions ?? 0), 0);
+    const metaClicks = daily.meta.reduce((s, p) => s + (p.clicks ?? 0), 0);
+    const metaRevenue = daily.meta.reduce((s, p) => s + (p.revenue ?? 0), 0);
     const metaSpend = curTotals[0];
     const metaCtr = metaImpr > 0 ? (metaClicks / metaImpr) * 100 : null;
     const metaRoas = metaSpend > 0 ? metaRevenue / metaSpend : null;
 
     const campaignRows = PLATFORMS.flatMap((p) =>
-      (campaignsByRange[p][String(range)] ?? []).map((c) => ({ ...c, platform: p })),
+      (campaigns[p] ?? []).map((c) => ({ ...c, platform: p })),
     ).sort((a, b) => b.spend - a.spend);
 
-    const taxCur = round2(dailyTax.slice(dailyTax.length - range).reduce((a, b) => a + b, 0));
+    const taxCur = round2(dailyTax.reduce((a, b) => a + b, 0));
 
-    return { curByPlatform, curTotals, combinedCur, deltaPct, connectedCount, metaCtr, metaRoas, campaignRows, taxCur };
-  }, [daily, dailyTax, campaignsByRange, connections, range]);
+    return { curTotals, combinedCur, deltaPct, connectedCount, metaCtr, metaRoas, campaignRows, taxCur };
+  }, [daily, dailyTax, campaigns, prevTotals, connections]);
 
   return (
     <Page
@@ -553,15 +558,14 @@ export default function AdSpend() {
       subtitle="Connect your ad platforms to calculate true ROAS across all of them"
     >
       <BlockStack gap="400">
-        <InlineStack align="end">
-          <ButtonGroup variant="segmented">
-            {RANGE_OPTIONS.map((n) => (
-              <Button key={n} pressed={range === n} onClick={() => setRange(n)}>
-                {`${n}D`}
-              </Button>
-            ))}
-          </ButtonGroup>
-        </InlineStack>
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h2" variant="headingMd">
+              {range.fromLabel} to {range.toLabel}
+            </Text>
+            <DateRangePicker fromLabel={range.fromLabel} toLabel={range.toLabel} />
+          </BlockStack>
+        </Card>
 
         {actionData && "message" in actionData && actionData.message && (
           <Banner tone="success">{actionData.message}</Banner>
@@ -578,14 +582,14 @@ export default function AdSpend() {
                 <IconBadge icon={CashDollarIcon} size={52} />
                 <BlockStack gap="0">
                   <Text as="p" tone="subdued" variant="bodyMd">
-                    Total ad spend · last {range} days · all platforms
+                    Total ad spend · {range.fromLabel} to {range.toLabel} · all platforms
                   </Text>
                   <Text as="p" variant="heading2xl" fontWeight="bold">
                     {money(view.combinedCur, blendedCurrency)}
                   </Text>
                   {view.deltaPct !== null && (
                     <Text as="span" variant="bodySm" tone={view.deltaPct >= 0 ? "success" : "critical"}>
-                      {view.deltaPct >= 0 ? "▲" : "▼"} {Math.abs(view.deltaPct).toFixed(1)}% vs previous {range} days
+                      {view.deltaPct >= 0 ? "▲" : "▼"} {Math.abs(view.deltaPct).toFixed(1)}% vs previous {range.days} days
                     </Text>
                   )}
                 </BlockStack>
@@ -615,6 +619,7 @@ export default function AdSpend() {
                 value: view.curTotals[i],
                 color: PLATFORM_COLOR[p],
               }))}
+              money={(n) => money(n, blendedCurrency)}
             />
             <Text as="p" tone="subdued" variant="bodySm">
               Ecommerce transaction tax is the government tax on card/processing payments to Meta, Google, TikTok and
@@ -721,8 +726,9 @@ export default function AdSpend() {
                   key: p,
                   label: PLATFORM_LABEL[p],
                   color: PLATFORM_COLOR[p],
-                  points: view.curByPlatform[p].map((pt) => ({ date: pt.date, spend: pt.spend })),
+                  points: daily[p].map((pt) => ({ date: pt.date, spend: pt.spend })),
                 }))}
+                money={(n) => money(n, blendedCurrency)}
               />
             </BlockStack>
           </Box>
