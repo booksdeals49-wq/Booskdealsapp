@@ -257,61 +257,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (intent === "connect") {
-    const accountId = String(form.get("accountId") ?? "").trim();
-
-    if (platform === "google") {
-      const developerToken = String(form.get("developerToken") ?? "").trim();
-      const clientId = String(form.get("clientId") ?? "").trim();
-      const clientSecret = String(form.get("clientSecret") ?? "").trim();
-      const refreshTokenInput = String(form.get("refreshToken") ?? "").trim();
-      if (!accountId || !developerToken || !clientId || !clientSecret) {
-        return json(
-          { ok: false, error: "Customer ID, developer token, client ID and client secret are all required." },
-          { status: 400 },
-        );
-      }
-      const existing = await prisma.adAccountConnection.findUnique({
-        where: { shop_platform: { shop, platform } },
-      });
-      // Only encrypt a freshly-typed refresh token — a reused existing value
-      // is already stored in whatever form it was last saved in (encrypted,
-      // or legacy plaintext waiting to be upgraded on its next real edit),
-      // so re-encrypting it here would double-encrypt and corrupt it.
-      const refreshToken = refreshTokenInput
-        ? encryptSecret(refreshTokenInput)
-        : existing?.accessToken || "";
-      if (!refreshToken) {
-        return json({ ok: false, error: "Refresh token is required for a first-time connection." }, { status: 400 });
-      }
-      const extraJson = encryptJson({ developerToken, clientId, clientSecret });
-      await prisma.adAccountConnection.upsert({
-        where: { shop_platform: { shop, platform } },
-        update: { accountId, accessToken: refreshToken, extraJson },
-        create: { shop, platform, accountId, accessToken: refreshToken, extraJson },
-      });
-      return json({ ok: true, message: "Google Ads account connected." });
-    }
-
-    const accessTokenInput = String(form.get("accessToken") ?? "").trim();
-    const existing = await prisma.adAccountConnection.findUnique({
-      where: { shop_platform: { shop, platform } },
-    });
-    if (!accountId || (!accessTokenInput && !existing)) {
+    // Wrapped in try/catch (unlike before) so a misconfigured or missing
+    // TOKEN_ENCRYPTION_KEY — required by encryptSecret/encryptJson below,
+    // see crypto.server.ts — shows a clear banner on this page instead of
+    // crashing the whole app with a generic "Application error" screen.
+    try {
+      return await handleConnect(platform, shop, form);
+    } catch (e: any) {
       return json(
-        { ok: false, error: "Account ID and access token are both required." },
-        { status: 400 },
+        {
+          ok: false,
+          error:
+            e?.message ??
+            "Couldn't save this connection — check the server's environment configuration.",
+        },
+        { status: 500 },
       );
     }
-    // Same "only encrypt what was actually resubmitted" rule as above.
-    const accessToken = accessTokenInput
-      ? encryptSecret(accessTokenInput)
-      : existing?.accessToken || "";
-    await prisma.adAccountConnection.upsert({
-      where: { shop_platform: { shop, platform } },
-      update: { accountId, accessToken },
-      create: { shop, platform, accountId, accessToken },
-    });
-    return json({ ok: true, message: `${PLATFORM_LABEL[platform]} ad account connected.` });
   }
 
   if (intent === "sync") {
@@ -406,6 +368,68 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   return json({ ok: false, error: "Unknown action." }, { status: 400 });
 };
+
+// Extracted out of action() so the "connect" intent's own try/catch above
+// (added to catch a missing/invalid TOKEN_ENCRYPTION_KEY — see crypto.server.ts)
+// can wrap it in one place, covering the Google branch and the shared
+// Meta/TikTok/Snapchat branch below with a single catch.
+async function handleConnect(platform: Platform, shop: string, form: FormData) {
+  const accountId = String(form.get("accountId") ?? "").trim();
+
+  if (platform === "google") {
+      const developerToken = String(form.get("developerToken") ?? "").trim();
+      const clientId = String(form.get("clientId") ?? "").trim();
+      const clientSecret = String(form.get("clientSecret") ?? "").trim();
+      const refreshTokenInput = String(form.get("refreshToken") ?? "").trim();
+      if (!accountId || !developerToken || !clientId || !clientSecret) {
+        return json(
+          { ok: false, error: "Customer ID, developer token, client ID and client secret are all required." },
+          { status: 400 },
+        );
+      }
+      const existing = await prisma.adAccountConnection.findUnique({
+        where: { shop_platform: { shop, platform } },
+      });
+      // Only encrypt a freshly-typed refresh token — a reused existing value
+      // is already stored in whatever form it was last saved in (encrypted,
+      // or legacy plaintext waiting to be upgraded on its next real edit),
+      // so re-encrypting it here would double-encrypt and corrupt it.
+      const refreshToken = refreshTokenInput
+        ? encryptSecret(refreshTokenInput)
+        : existing?.accessToken || "";
+      if (!refreshToken) {
+        return json({ ok: false, error: "Refresh token is required for a first-time connection." }, { status: 400 });
+      }
+      const extraJson = encryptJson({ developerToken, clientId, clientSecret });
+      await prisma.adAccountConnection.upsert({
+        where: { shop_platform: { shop, platform } },
+        update: { accountId, accessToken: refreshToken, extraJson },
+        create: { shop, platform, accountId, accessToken: refreshToken, extraJson },
+      });
+      return json({ ok: true, message: "Google Ads account connected." });
+    }
+
+    const accessTokenInput = String(form.get("accessToken") ?? "").trim();
+    const existing = await prisma.adAccountConnection.findUnique({
+      where: { shop_platform: { shop, platform } },
+    });
+    if (!accountId || (!accessTokenInput && !existing)) {
+      return json(
+        { ok: false, error: "Account ID and access token are both required." },
+        { status: 400 },
+      );
+    }
+    // Same "only encrypt what was actually resubmitted" rule as above.
+    const accessToken = accessTokenInput
+      ? encryptSecret(accessTokenInput)
+      : existing?.accessToken || "";
+    await prisma.adAccountConnection.upsert({
+      where: { shop_platform: { shop, platform } },
+      update: { accountId, accessToken },
+      create: { shop, platform, accountId, accessToken },
+    });
+  return json({ ok: true, message: `${PLATFORM_LABEL[platform]} ad account connected.` });
+}
 
 function money(n: number) {
   return "$" + n.toFixed(2);
