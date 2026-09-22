@@ -28,7 +28,7 @@ import {
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { fetchMetaDailySpend } from "../services/metaAds.server";
+import { fetchMetaDailySpend, fetchMetaAdAccountCurrency } from "../services/metaAds.server";
 import { fetchTiktokDailySpend } from "../services/tiktokAds.server";
 import { fetchSnapchatDailySpend } from "../services/snapchatAds.server";
 import { fetchGoogleAdsDailySpend } from "../services/googleAds.server";
@@ -296,6 +296,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const syncDays = 30;
       if (platform === "meta") {
         spend = await fetchMetaDailySpend(accessToken, connection.accountId, syncDays);
+        // The spend figures above are denominated in the ad account's own
+        // reporting currency (e.g. PKR for a Pakistan-based account), not
+        // necessarily USD — save it alongside the connection so the UI can
+        // label numbers correctly instead of assuming "$". Best-effort: a
+        // failed lookup here just leaves the currency unset for this sync,
+        // it never blocks the spend sync itself.
+        const metaCurrency = await fetchMetaAdAccountCurrency(accessToken, connection.accountId);
+        if (metaCurrency) {
+          const existingExtra = decryptJson(connection.extraJson);
+          await prisma.adAccountConnection.update({
+            where: { shop_platform: { shop, platform } },
+            data: { extraJson: encryptJson({ ...existingExtra, currency: metaCurrency }) },
+          });
+        }
       } else if (platform === "tiktok") {
         spend = await fetchTiktokDailySpend(accessToken, connection.accountId, syncDays);
       } else if (platform === "snapchat") {
@@ -431,8 +445,25 @@ async function handleConnect(platform: Platform, shop: string, form: FormData) {
   return json({ ok: true, message: `${PLATFORM_LABEL[platform]} ad account connected.` });
 }
 
-function money(n: number) {
-  return "$" + n.toFixed(2);
+// Ad spend figures are denominated in whatever currency the connected ad
+// account itself reports in — for Meta that's fetched and saved per
+// connection (see fetchMetaAdAccountCurrency in the action above), NOT
+// necessarily USD. Same Intl.NumberFormat approach the Dashboard/Orders/
+// Reports pages already use for the shop's own currency (see e.g.
+// app._index.tsx's own money()). Falls back to a plain "$"-prefixed number
+// only when no currency is known yet (a connection made before this fix,
+// not yet re-synced).
+function money(n: number, currency?: string) {
+  if (!currency) return "$" + n.toFixed(2);
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency,
+      currencyDisplay: "narrowSymbol",
+    }).format(n);
+  } catch {
+    return `${currency} ${n.toFixed(2)}`;
+  }
 }
 
 function sum(points: DailyPoint[]) {
@@ -468,6 +499,15 @@ export default function AdSpend() {
   const [range, setRange] = useState<RangeDays>(30);
   const platform = PLATFORMS[selected];
   const platformUnlocked = (unlocked as readonly string[]).includes(platform);
+
+  // Currency for the combined/blended totals (hero card, tax, campaign
+  // table) — the first connected platform that has reported its own
+  // currency (see fetchMetaAdAccountCurrency), so numbers aren't mislabeled
+  // "$" when they're actually e.g. PKR. Blending spend across platforms
+  // that report in genuinely DIFFERENT currencies would still be wrong
+  // math, not just a wrong label — not a concern today since only one
+  // platform is typically connected, but worth knowing if that changes.
+  const blendedCurrency = PLATFORMS.map((p) => connections[p].extra?.currency).find(Boolean);
 
   const tabs = PLATFORMS.map((p) => ({
     id: p,
@@ -541,7 +581,7 @@ export default function AdSpend() {
                     Total ad spend · last {range} days · all platforms
                   </Text>
                   <Text as="p" variant="heading2xl" fontWeight="bold">
-                    {money(view.combinedCur)}
+                    {money(view.combinedCur, blendedCurrency)}
                   </Text>
                   {view.deltaPct !== null && (
                     <Text as="span" variant="bodySm" tone={view.deltaPct >= 0 ? "success" : "critical"}>
@@ -564,7 +604,7 @@ export default function AdSpend() {
                 />
                 <StatMini
                   label="Ecommerce transaction tax"
-                  value={money(view.taxCur)}
+                  value={money(view.taxCur, blendedCurrency)}
                   badge={currentTaxPercent > 0 ? `${currentTaxPercent}%` : undefined}
                 />
               </InlineStack>
@@ -630,7 +670,7 @@ export default function AdSpend() {
                       </>
                     ) : connected ? (
                       <>
-                        <Text as="p" variant="headingLg" fontWeight="bold">{money(spendVal)}</Text>
+                        <Text as="p" variant="headingLg" fontWeight="bold">{money(spendVal, connections[p].extra?.currency)}</Text>
                         <InlineStack gap="400">
                           <div style={{ flex: 1 }}>
                             <Text as="p" tone="subdued" variant="bodySm">CTR</Text>
@@ -734,7 +774,7 @@ export default function AdSpend() {
                         {r.campaign}
                       </td>
                       <td style={{ padding: "12px 20px", borderBottom: "1px solid #F1F2F4", textAlign: "right", fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
-                        {money(r.spend)}
+                        {money(r.spend, connections[r.platform].extra?.currency)}
                       </td>
                       <td style={{ padding: "12px 20px", borderBottom: "1px solid #F1F2F4", textAlign: "right" }}>
                         {r.ctr !== null ? (

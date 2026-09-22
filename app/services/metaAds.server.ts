@@ -29,6 +29,34 @@ function extractRoas(purchaseRoas: any[] | undefined): number {
   return Number(preferred?.value ?? 0);
 }
 
+/**
+ * The ad account's own reporting currency (e.g. "PKR", "USD") — every
+ * `spend`/`revenue` figure fetchMetaDailySpend returns below is already
+ * denominated in THIS currency, not necessarily USD. Meta's /insights
+ * endpoint doesn't include it on the daily rows, so this is a second,
+ * lightweight call straight to the ad account node. Returns null (rather
+ * than throwing) on any failure — the caller falls back to treating the
+ * connection as un-labeled rather than blocking the whole sync over a
+ * currency lookup.
+ */
+export async function fetchMetaAdAccountCurrency(
+  accessToken: string,
+  adAccountId: string,
+): Promise<string | null> {
+  const accountId = adAccountId.startsWith("act_") ? adAccountId : `act_${adAccountId}`;
+  const url = new URL(`https://graph.facebook.com/${META_GRAPH_VERSION}/${accountId}`);
+  url.searchParams.set("fields", "currency");
+  url.searchParams.set("access_token", accessToken);
+  try {
+    const response = await fetch(url.toString());
+    if (!response.ok) return null;
+    const body = await response.json();
+    return typeof body?.currency === "string" ? body.currency : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchMetaDailySpend(
   accessToken: string,
   adAccountId: string,
