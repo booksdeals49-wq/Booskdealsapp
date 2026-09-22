@@ -66,7 +66,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // default. This constant only controls how far back backfillRecentOrders
 // looks when reconciling with Shopify, so older orders actually get pulled
 // in and stored without changing the Dashboard's own 30-day display window.
-const BACKFILL_DAYS = 60;
+// Set to 90 to cover the Orders page's widest quick-preset (Last 90 days) —
+// picking a custom range further back than this on the Orders page can
+// still come up empty for orders older than this window that predate when
+// the app was installed (nothing before install ever fires a webhook for
+// them), since this is the only thing that pulls older history in.
+const BACKFILL_DAYS = 90;
 
 // Each stat card links to the page that explains it, colored by
 // destination — not by whether the number is good or bad, that's what the

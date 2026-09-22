@@ -76,6 +76,7 @@ export function DateRangePicker({
         {preset("Last 7 days", 7)}
         {preset("Last 14 days", 14)}
         {preset("Last 30 days", 30)}
+        {preset("Last 60 days", 60)}
         {preset("Last 90 days", 90)}
         <Button onClick={thisMonth}>This month</Button>
       </ButtonGroup>

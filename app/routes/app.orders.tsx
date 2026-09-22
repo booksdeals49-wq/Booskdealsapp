@@ -24,22 +24,25 @@ import {
 } from "../services/costSettingsHistory.server";
 import { getCourierRateOverrides } from "../services/courierRates.server";
 import { StatCard, SectionHeading } from "../components/StatTile";
+import { resolveDateRange } from "../utils/dateRange.server";
+import { DateRangePicker } from "../components/DateRangePicker";
 
-const PAGE_DAYS = 60;
 // A generous safety ceiling, not a real-world expectation — matches the same
-// 2,000-order cap backfillRecentOrders uses for its own sync window, so this
+// 3,000-order cap backfillRecentOrders uses for its own sync window, so this
 // list can never run further ahead of what's actually been synced in.
-const PAGE_ORDER_CAP = 2000;
+const PAGE_ORDER_CAP = 3000;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
+  const url = new URL(request.url);
+  const range = resolveDateRange(url);
 
   const [orders, costSettingsHistory, productCosts, courierRates] = await Promise.all([
     prisma.orderRecord.findMany({
       where: {
         shop,
-        createdAt: { gte: new Date(Date.now() - PAGE_DAYS * 24 * 60 * 60 * 1000) },
+        createdAt: { gte: range.from, lt: range.to },
       },
       orderBy: { createdAt: "desc" },
       take: PAGE_ORDER_CAP,
@@ -128,7 +131,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   });
 
-  return json({ rows });
+  return json({ rows, range });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -193,7 +196,7 @@ function money(n: number, currency: string) {
 }
 
 export default function Orders() {
-  const { rows } = useLoaderData<typeof loader>();
+  const { rows, range } = useLoaderData<typeof loader>();
   const submit = useSubmit();
   const navigation = useNavigation();
 
@@ -216,8 +219,16 @@ export default function Orders() {
   const currency = rows[0]?.currency ?? "USD";
 
   return (
-    <Page title="Orders" subtitle={`Last ${PAGE_DAYS} days · profit per order`}>
+    <Page title="Orders" subtitle="Profit per order, for the selected date range">
       <BlockStack gap="400">
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h2" variant="headingMd">
+              {range.fromLabel} to {range.toLabel}
+            </Text>
+            <DateRangePicker fromLabel={range.fromLabel} toLabel={range.toLabel} />
+          </BlockStack>
+        </Card>
         {rows.length > 0 && (
           <InlineGrid columns={{ xs: 1, sm: 3 }} gap="400">
             <StatCard icon={OrderIcon} label="Orders" value={String(rows.length)} />
@@ -241,7 +252,7 @@ export default function Orders() {
             <SectionHeading
               icon={OrderIcon}
               title="Recent orders"
-              subtitle={`Last ${PAGE_DAYS} days, most recent first`}
+              subtitle={`${range.fromLabel} to ${range.toLabel}, most recent first`}
             />
           </div>
         <IndexTable

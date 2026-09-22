@@ -485,9 +485,9 @@ export async function backfillRecentOrders(
       }
     }`;
 
-  // Far more than a "recent backfill" pass is meant to cover — 20 × 100 =
-  // 2,000 orders in the window before this stops paginating further.
-  const MAX_PAGES = 20;
+  // Matches the Orders page's own PAGE_ORDER_CAP — 30 × 100 = 3,000 orders
+  // in the window before this stops paginating further.
+  const MAX_PAGES = 30;
   const allEdges: any[] = [];
   let cursor: string | null = null;
   let hasNextPage = true;
