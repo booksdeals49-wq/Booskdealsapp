@@ -1,0 +1,75 @@
+# This file stores configuration for the Shopify app.
+# Run `shopify app config link` in your Partner Dashboard-connected CLI
+# to populate client_id and replace the placeholder values below.
+
+client_id = "7640aaa57956d06daac541cdf69d93f3"
+name = "True COD Profit"
+handle = "cod-profit-app"
+application_url = "https://cod-profit-app-production-efa1.up.railway.app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+dev_store_url = "cod-profit-app.myshopify.com"
+
+[access_scopes]
+# Minimum scopes for MVP: read orders/products for profit calc, write_orders
+# to tag orders as RTO. read_fulfillments is required specifically to
+# subscribe to the FULFILLMENTS_UPDATE webhook topic (courier "in
+# transit"/"delivered" tracking updates) — Shopify rejects that webhook
+# subscription outright without it. The GraphQL queries this app already
+# makes (fulfillment deliveredAt/inTransitAt/createdAt/trackingInfo) are
+# covered by read_orders and don't need this scope on their own; it's the
+# webhook subscription specifically that requires it.
+#
+# read_customers was dropped (it used to be requested "for shipping city",
+# per an old comment here) — nothing in this app has ever actually queried
+# Shopify's Customer object, and the city field was separately removed from
+# every GraphQL query specifically to avoid the Protected Customer Data
+# Level 2 requirement (see app.city-performance.tsx). Keeping an unused
+# scope only widens what a merchant sees on the install-consent screen and
+# what has to be justified in Shopify's protected-data review — no upside.
+scopes = "read_orders,write_orders,read_products,read_fulfillments"
+
+[auth]
+redirect_urls = [
+  "https://cod-profit-app-production-efa1.up.railway.app/auth/callback",
+  "https://cod-profit-app-production-efa1.up.railway.app/auth/shopify/callback",
+  "https://cod-profit-app-production-efa1.up.railway.app/api/auth/callback",
+  "https://cod-profit-app-production-efa1.up.railway.app/api/auth"
+]
+
+[webhooks]
+api_version = "2025-01"
+
+  [[webhooks.subscriptions]]
+  topics = ["app/uninstalled"]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = ["orders/create"]
+  uri = "/webhooks/orders/create"
+
+  [[webhooks.subscriptions]]
+  topics = ["orders/updated"]
+  uri = "/webhooks/orders/updated"
+
+  [[webhooks.subscriptions]]
+  topics = ["orders/cancelled"]
+  uri = "/webhooks/orders/updated"
+
+  # Mandatory GDPR compliance webhooks - required for every public app.
+  [[webhooks.subscriptions]]
+  topics = ["customers/data_request"]
+  uri = "/webhooks/customers/data_request"
+
+  [[webhooks.subscriptions]]
+  topics = ["customers/redact"]
+  uri = "/webhooks/customers/redact"
+
+  [[webhooks.subscriptions]]
+  topics = ["shop/redact"]
+  uri = "/webhooks/shop/redact"
+
+[pos]
+embedded = false

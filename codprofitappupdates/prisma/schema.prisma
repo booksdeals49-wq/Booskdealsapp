@@ -1,0 +1,124 @@
+// Prisma schema for the COD Profit Analytics app.
+// SQLite is used for single-store development; switch the datasource to
+// postgresql for production / multi-merchant deployments.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Required by @shopify/shopify-app-session-storage-prisma
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+}
+
+// Per-shop cost model used to compute "true" COD profit.
+// All monetary fields are stored in the shop's default currency, as minor
+// units are easy to get wrong across currencies with different decimal
+// places, so we store as Float in major units for MVP simplicity.
+model CostSettings {
+  id                    String   @id @default(cuid())
+  shop                  String   @unique
+  currency              String   @default("USD")
+  defaultCogsPercent    Float    @default(35) // fallback % of item price used as COGS when no per-product override exists
+  deliveryFeeFlat       Float    @default(0) // charged on every order (delivered or not)
+  rtoFeeFlat            Float    @default(0) // extra cost incurred only when an order is returned to origin
+  cashHandlingPercent   Float    @default(0) // COD cash handling / collection fee, % of order total
+  taxPercent            Float    @default(0) // VAT / GST applied to revenue
+  packagingFeeFlat      Float    @default(0)
+  // When true, a returned-to-origin order's product cost (COGS) is NOT
+  // counted as a loss — the assumption is the item comes back sellable and
+  // goes back into inventory, so only delivery + RTO shipping are real
+  // losses. When false (default — conservative), COGS is written off in
+  // full on every RTO, assuming returns are often damaged/unsellable.
+  rtoRestockable        Boolean  @default(false)
+  updatedAt             DateTime @updatedAt
+  createdAt             DateTime @default(now())
+}
+
+// Per-product/variant COGS override. Falls back to CostSettings.defaultCogsPercent
+// when no row exists for a given variant.
+model ProductCost {
+  id          String   @id @default(cuid())
+  shop        String
+  variantId   String // Shopify GID, e.g. gid://shopify/ProductVariant/123
+  productId   String
+  title       String?
+  costPerUnit Float
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([shop, variantId])
+  @@index([shop])
+}
+
+// Local cache of Shopify orders relevant to profit computation, kept in
+// sync via webhooks. We do NOT duplicate full customer PII here beyond
+// city/country, which is the minimum needed for geographic RTO analysis.
+model OrderRecord {
+  id                String   @id @default(cuid())
+  shop              String
+  orderId           String // Shopify GID
+  orderNumber       String
+  totalPrice        Float
+  subtotalPrice     Float
+  currency          String
+  financialStatus   String?
+  fulfillmentStatus String?
+  isCod             Boolean  @default(false)
+  isRto             Boolean  @default(false) // merchant-flagged or inferred from cancel reason/tag
+  city              String?
+  country           String?
+  channel           String? // e.g. "online_store", "pos", or UTM-derived channel
+  lineItemsJson     String // JSON-serialized [{variantId, productId, title, quantity, price}]
+  createdAt         DateTime
+  syncedAt          DateTime @default(now())
+
+  @@unique([shop, orderId])
+  @@index([shop, createdAt])
+  @@index([shop, city])
+}
+
+// Per-shop connection + daily spend cache for an ad platform (Meta first).
+model AdAccountConnection {
+  id           String   @id @default(cuid())
+  shop         String
+  platform     String // "meta" | "google" | "tiktok" | "snapchat"
+  accountId    String
+  accessToken  String // consider encrypting at rest before production use
+  connectedAt  DateTime @default(now())
+
+  @@unique([shop, platform])
+}
+
+model AdSpend {
+  id        String   @id @default(cuid())
+  shop      String
+  platform  String
+  date      DateTime // day granularity
+  spend     Float
+  currency  String   @default("USD")
+  campaign  String?
+  syncedAt  DateTime @default(now())
+
+  @@unique([shop, platform, date, campaign])
+  @@index([shop, date])
+}

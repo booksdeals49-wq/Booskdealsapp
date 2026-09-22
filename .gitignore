@@ -1,0 +1,9 @@
+node_modules
+/build
+.env
+*.sqlite
+*.sqlite-journal
+.DS_Store
+/public/build
+.cache
+dist

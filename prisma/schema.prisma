@@ -1,0 +1,263 @@
+// Prisma schema for the COD Profit Analytics app.
+//
+// Provider is postgresql — needed for a real deployment (a persistent
+// server needs a real database server, not a local SQLite file that lives
+// on one machine's disk). Local development also points DATABASE_URL at a
+// Postgres instance now (a free one, e.g. Railway/Neon, works fine) rather
+// than the old dev.sqlite file — see .env.example.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Required by @shopify/shopify-app-session-storage-prisma
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  // Added for the expiringOfflineAccessTokens future flag (shopify.server.ts).
+  // Shopify now issues short-lived offline access tokens plus a refresh
+  // token; the library needs somewhere to persist the refresh token and its
+  // expiry so it can transparently refresh the access token before it
+  // expires, instead of the old non-expiring token Shopify has stopped
+  // accepting for the Admin API entirely.
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// Per-shop cost model used to compute "true" COD profit.
+// All monetary fields are stored in the shop's default currency, as minor
+// units are easy to get wrong across currencies with different decimal
+// places, so we store as Float in major units for MVP simplicity.
+// Historical/versioned: a shop can have MULTIPLE rows here over time. Saving
+// the Settings page inserts a new row rather than editing the existing one,
+// so a rate change (e.g. the courier raising its delivery fee) only applies
+// to orders dispatched from that moment forward — an order already
+// dispatched under the old rate keeps using it forever. See
+// costSettingsHistory.server.ts for how a given order's version is picked
+// (the most recent version whose effectiveFrom is <= that order's own
+// dispatch/placement date).
+model CostSettings {
+  id                    String   @id @default(cuid())
+  shop                  String
+  currency              String   @default("USD")
+  defaultCogsPercent    Float    @default(35) // fallback % of item price used as COGS when no per-product override exists
+  deliveryFeeFlat       Float    @default(0) // charged on every order (delivered or not)
+  rtoFeeFlat            Float    @default(0) // extra cost incurred only when an order is returned to origin
+  cashHandlingPercent   Float    @default(0) // COD cash handling / collection fee, % of order total
+  taxPercent            Float    @default(0) // VAT / GST applied to revenue
+  packagingFeeFlat      Float    @default(0)
+  // Government-levied tax on ad-platform transactions (card/processing tax
+  // charged when paying Meta/Google/TikTok/Snapchat) — % of ad spend, not
+  // revenue. One blended rate across all ad platforms, since that's how the
+  // merchant is actually taxed. Applied at the aggregate level (total ad
+  // spend × this %), not per-order — see costSettingsResolver.ts's
+  // computeAdSpendTax.
+  ecommerceTransactionTaxPercent Float @default(0)
+  // When true, a returned-to-origin order's product cost (COGS) is NOT
+  // counted as a loss — the assumption is the item comes back sellable and
+  // goes back into inventory, so only delivery + RTO shipping are real
+  // losses. When false (default — conservative), COGS is written off in
+  // full on every RTO, assuming returns are often damaged/unsellable.
+  rtoRestockable        Boolean  @default(false)
+  // The moment this version's rates start applying. The very first version
+  // ever created for a shop is backdated to the epoch so it covers every
+  // order that predates the shop ever configuring settings.
+  effectiveFrom         DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  createdAt             DateTime @default(now())
+
+  @@index([shop, effectiveFrom])
+}
+
+// Per-product/variant COGS override. Falls back to CostSettings.defaultCogsPercent
+// when no row exists for a given variant.
+model ProductCost {
+  id          String   @id @default(cuid())
+  shop        String
+  variantId   String // Shopify GID, e.g. gid://shopify/ProductVariant/123
+  productId   String
+  title       String?
+  costPerUnit Float
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([shop, variantId])
+  @@index([shop])
+}
+
+// Local cache of Shopify orders relevant to profit computation, kept in
+// sync via webhooks. We do NOT duplicate full customer PII here beyond
+// city/country, which is the minimum needed for geographic RTO analysis.
+model OrderRecord {
+  id                String   @id @default(cuid())
+  shop              String
+  orderId           String // Shopify GID
+  orderNumber       String
+  totalPrice        Float
+  subtotalPrice     Float
+  currency          String
+  financialStatus   String?
+  fulfillmentStatus String?
+  isCod             Boolean  @default(false)
+  isRto             Boolean  @default(false) // merchant-flagged or inferred: cancelled AND had already been dispatched, or explicitly tagged/reasoned as a return
+  // When Shopify shows this order as cancelled, regardless of whether it
+  // turned out to be an RTO. A cancellation before the order was ever
+  // dispatched (stock issue, fraud check, customer changed their mind) is
+  // NOT an RTO — no delivery was attempted — but it's still not a normal
+  // completed order either, so it's tracked here distinctly. See
+  // orderSync.server.ts's computeIsRto for how isRto vs. this is decided.
+  cancelledAt       DateTime?
+  // When the courier's tracking update told Shopify this order was actually
+  // delivered (Fulfillment.deliveredAt via GraphQL, or a fulfillment's
+  // shipment_status = "delivered" via webhook). Drives revenue realization
+  // for COD orders — see profit.server.ts. Null until delivery is confirmed;
+  // never cleared once set (see orderSync.server.ts for why).
+  deliveredAt       DateTime?
+  // When the order was actually handed to the courier — Fulfillment.createdAt
+  // via GraphQL, or a fulfillment webhook's created_at. Distinct from the
+  // live fulfillmentStatus string above: this is a fixed point in time,
+  // captured once, used to pick which historical CostSettings version this
+  // order's costs are computed under (see costSettingsHistory.server.ts) —
+  // NOT to decide whether costs are incurred at all (that's still the live
+  // fulfillmentStatus via orderSync.server.ts's wasDispatched, so a merchant
+  // correcting a fulfillment in Shopify is still picked up). Null until the
+  // order actually ships; never cleared once set.
+  dispatchedAt      DateTime?
+  // When the courier's own tracking told Shopify the shipment is actually
+  // in transit — Fulfillment.inTransitAt via GraphQL, or a fulfillment
+  // webhook's shipment_status reaching "in_transit" (or a later real-movement
+  // status). This is deliberately a SEPARATE signal from fulfillmentStatus/
+  // dispatchedAt above: Shopify showing an order as "fulfilled" only means
+  // the merchant/shipper generated a label and handed it off internally —
+  // it does NOT mean the courier has actually picked it up yet. Drives the
+  // Orders page's 3-way status badge (see app.orders.tsx). Null until the
+  // courier confirms movement; never cleared once set.
+  inTransitAt       DateTime?
+  city              String?
+  country           String?
+  // Which courier/tracking company actually shipped this order — Shopify's
+  // Fulfillment.trackingInfo.company (GraphQL) / a fulfillment webhook's
+  // tracking_company (REST), captured automatically as soon as Shopify
+  // knows it. Whatever the merchant/courier-integration entered verbatim
+  // (e.g. "TCS", "Leopards Courier", "PostEx") — matched case-insensitively
+  // against CourierRate.courierName in profit.server.ts to pick a
+  // per-courier delivery cost instead of the flat
+  // CostSettings.deliveryFeeFlat. Null until a fulfillment with tracking
+  // info exists; last-known-value wins on every sync (this is a live
+  // Shopify fact, not something a merchant hand-edits, so — unlike
+  // isRto/deliveredAt/dispatchedAt — it's safe to overwrite on every pass).
+  trackingCompany   String?
+  channel           String? // raw Shopify order source_name, e.g. "web", "pos"
+  referringSite     String? // raw referring URL at checkout, e.g. "https://www.facebook.com/" — used to classify marketing channel (see services/channel.ts). Only populated via webhook sync; historical backfilled orders won't have it.
+  lineItemsJson     String // JSON-serialized [{variantId, productId, title, quantity, price}]
+  createdAt         DateTime
+  syncedAt          DateTime @default(now())
+
+  @@unique([shop, orderId])
+  @@index([shop, createdAt])
+  @@index([shop, city])
+}
+
+// Per-shop connection + daily spend cache for an ad platform.
+model AdAccountConnection {
+  id           String   @id @default(cuid())
+  shop         String
+  platform     String // "meta" | "google" | "tiktok" | "snapchat"
+  accountId    String
+  accessToken  String // consider encrypting at rest before production use
+  // Platform-specific extra credentials that don't fit accountId/accessToken
+  // alone (e.g. Google Ads needs a developer token + OAuth client id/secret
+  // alongside the refresh token). JSON-serialized, shape varies by platform.
+  extraJson    String?
+  connectedAt  DateTime @default(now())
+
+  @@unique([shop, platform])
+}
+
+// Tracks Shopify Billing API state per shop — see app/services/billing.server.ts
+// and app/services/billingPlans.ts. Plain flat-rate plan subscriptions: the
+// merchant picks Free/Starter/Growth/Pro and approves that plan's price
+// directly (standard Shopify subscription flow, no usage-based billing).
+// orderCount/periodStart track the free plan's 100-orders/month cap.
+model BillingState {
+  id              String   @id @default(cuid())
+  shop            String   @unique
+  subscriptionId  String? // Shopify GID of the active/pending AppSubscription
+  confirmationUrl String? // Shopify-hosted approval URL for a pending subscription
+  plan            String   @default("free") // free | starter | growth | pro
+  billingInterval String   @default("monthly") // monthly | annual
+  status          String   @default("none") // none | pending | active | declined
+  periodStart     DateTime @default(now())
+  orderCount      Int      @default(0)
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+}
+
+// Per-courier delivery cost, set by the merchant in Cost Settings — e.g.
+// TCS, Trax, Leopards, PostEx, Daraz for a Pakistan-based store. A
+// deliberately simple "current value only" model, NOT versioned by
+// effectiveFrom like CostSettings above — the same precedent already used
+// for ProductCost (per-product cost overrides) in this app, where a rate
+// change just applies going forward for every future lookup rather than
+// being pinned to history. When an order's detected courier
+// (OrderRecord.trackingCompany, captured automatically from Shopify's
+// fulfillment tracking info — see orderSync.server.ts) matches a row here,
+// its cost REPLACES the flat CostSettings.deliveryFeeFlat for that order;
+// an order with no detected courier, or one that matches nothing here,
+// keeps using the flat fee. See profit.server.ts's resolveDeliveryFee for
+// the (case-insensitive, substring-tolerant) matching rule.
+model CourierRate {
+  id          String   @id @default(cuid())
+  shop        String
+  courierName String // as entered by the merchant, e.g. "TCS", "Leopards Courier" — shown in the UI and used for matching
+  // Lowercased/trimmed courierName — used for case-insensitive uniqueness
+  // (so a merchant can't accidentally create both "TCS" and "tcs" as
+  // separate rows) and as the fast lookup key.
+  courierKey  String
+  cost        Float
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([shop, courierKey])
+  @@index([shop])
+}
+
+model AdSpend {
+  id          String   @id @default(cuid())
+  shop        String
+  platform    String
+  date        DateTime // day granularity
+  spend       Float
+  currency    String   @default("USD")
+  campaign    String?
+  // Only populated where the platform's API provides them today (Meta) —
+  // 0 for platforms that don't yet fetch these fields. CTR/ROAS are always
+  // derived from these raw sums at read time (never averaged as
+  // percentages/ratios directly), so aggregating across days/campaigns
+  // stays mathematically correct.
+  impressions Int      @default(0)
+  clicks      Int      @default(0)
+  revenue     Float    @default(0)
+  syncedAt    DateTime @default(now())
+
+  @@unique([shop, platform, date, campaign])
+  @@index([shop, date])
+}
