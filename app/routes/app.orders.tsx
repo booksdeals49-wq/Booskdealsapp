@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { useLoaderData, useSubmit, useNavigation } from "@remix-run/react";
@@ -11,8 +12,10 @@ import {
   InlineStack,
   InlineGrid,
   Button,
+  TextField,
+  Select,
 } from "@shopify/polaris";
-import { OrderIcon, ReturnIcon, CashDollarIcon } from "@shopify/polaris-icons";
+import { OrderIcon, ReturnIcon, CashDollarIcon, SearchIcon } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { computeOrderProfit } from "../services/profit.server";
@@ -31,6 +34,45 @@ import { DateRangePicker } from "../components/DateRangePicker";
 // 3,000-order cap backfillRecentOrders uses for its own sync window, so this
 // list can never run further ahead of what's actually been synced in.
 const PAGE_ORDER_CAP = 3000;
+
+// Single source of truth for the same status logic the Status column's
+// Badge already branched on inline — used for the badge AND the new status
+// filter below, so the two can never quietly drift apart from each other.
+type StatusKey =
+  | "awaiting_fulfillment"
+  | "awaiting_courier"
+  | "in_transit"
+  | "delivered_active"
+  | "rto"
+  | "cancelled";
+
+const STATUS_FILTER_OPTIONS: Array<{ label: string; value: "all" | StatusKey }> = [
+  { label: "All statuses", value: "all" },
+  { label: "Awaiting fulfillment", value: "awaiting_fulfillment" },
+  { label: "Fulfilled, awaiting courier", value: "awaiting_courier" },
+  { label: "In transit", value: "in_transit" },
+  { label: "Delivered / active", value: "delivered_active" },
+  { label: "RTO", value: "rto" },
+  { label: "Cancelled", value: "cancelled" },
+];
+
+function statusKeyFor(r: {
+  isRto: boolean;
+  isCancelled: boolean;
+  isCod: boolean;
+  isDelivered: boolean;
+  isInTransit: boolean;
+  isDispatched: boolean;
+}): StatusKey {
+  if (r.isRto) return "rto";
+  if (r.isCancelled) return "cancelled";
+  if (r.isCod && !r.isDelivered) {
+    if (r.isInTransit) return "in_transit";
+    if (r.isDispatched) return "awaiting_courier";
+    return "awaiting_fulfillment";
+  }
+  return "delivered_active";
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -200,6 +242,22 @@ export default function Orders() {
   const submit = useSubmit();
   const navigation = useNavigation();
 
+  const [searchQuery, setSearchQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | StatusKey>("all");
+
+  // Client-side — every order in the selected date range is already loaded
+  // (see PAGE_ORDER_CAP above), so filtering the already-fetched list here
+  // is instant and doesn't need a round trip to the server on every
+  // keystroke or filter change.
+  const filteredRows = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return rows.filter((r) => {
+      if (query && !r.orderNumber.toLowerCase().includes(query)) return false;
+      if (statusFilter !== "all" && statusKeyFor(r) !== statusFilter) return false;
+      return true;
+    });
+  }, [rows, searchQuery, statusFilter]);
+
   const toggleRto = (orderRecordId: string, currentIsRto: boolean) => {
     submit(
       { orderRecordId, nextIsRto: String(!currentIsRto) },
@@ -214,9 +272,10 @@ export default function Orders() {
     );
   };
 
-  const rtoCount = rows.filter((r) => r.isRto).length;
-  const totalNetProfit = rows.reduce((s, r) => s + r.netProfit, 0);
-  const currency = rows[0]?.currency ?? "USD";
+  const rtoCount = filteredRows.filter((r) => r.isRto).length;
+  const totalNetProfit = filteredRows.reduce((s, r) => s + r.netProfit, 0);
+  const currency = filteredRows[0]?.currency ?? rows[0]?.currency ?? "USD";
+  const isFiltered = searchQuery.trim() !== "" || statusFilter !== "all";
 
   return (
     <Page title="Orders" subtitle="Profit per order, for the selected date range">
@@ -229,14 +288,14 @@ export default function Orders() {
             <DateRangePicker fromLabel={range.fromLabel} toLabel={range.toLabel} />
           </BlockStack>
         </Card>
-        {rows.length > 0 && (
+        {filteredRows.length > 0 && (
           <InlineGrid columns={{ xs: 1, sm: 3 }} gap="400">
-            <StatCard icon={OrderIcon} label="Orders" value={String(rows.length)} />
+            <StatCard icon={OrderIcon} label="Orders" value={String(filteredRows.length)} />
             <StatCard
               icon={ReturnIcon}
               label="RTO"
-              value={`${rtoCount} (${rows.length > 0 ? ((rtoCount / rows.length) * 100).toFixed(1) : "0"}%)`}
-              tone={rtoCount / Math.max(rows.length, 1) > 0.2 ? "critical" : undefined}
+              value={`${rtoCount} (${filteredRows.length > 0 ? ((rtoCount / filteredRows.length) * 100).toFixed(1) : "0"}%)`}
+              tone={rtoCount / Math.max(filteredRows.length, 1) > 0.2 ? "critical" : undefined}
             />
             <StatCard
               icon={CashDollarIcon}
@@ -252,12 +311,42 @@ export default function Orders() {
             <SectionHeading
               icon={OrderIcon}
               title="Recent orders"
-              subtitle={`${range.fromLabel} to ${range.toLabel}, most recent first`}
+              subtitle={
+                isFiltered
+                  ? `${filteredRows.length} of ${rows.length} order(s) match, within ${range.fromLabel} to ${range.toLabel}`
+                  : `${range.fromLabel} to ${range.toLabel}, most recent first`
+              }
             />
+          </div>
+          <div style={{ padding: "0 16px 16px" }}>
+            <InlineStack gap="300" wrap blockAlign="start">
+              <div style={{ minWidth: "240px", flex: "1 1 240px" }}>
+                <TextField
+                  label="Search"
+                  labelHidden
+                  placeholder="Search by order number"
+                  prefix={<SearchIcon width={16} height={16} />}
+                  value={searchQuery}
+                  onChange={setSearchQuery}
+                  clearButton
+                  onClearButtonClick={() => setSearchQuery("")}
+                  autoComplete="off"
+                />
+              </div>
+              <div style={{ minWidth: "220px" }}>
+                <Select
+                  label="Status"
+                  labelHidden
+                  options={STATUS_FILTER_OPTIONS}
+                  value={statusFilter}
+                  onChange={(value) => setStatusFilter(value as "all" | StatusKey)}
+                />
+              </div>
+            </InlineStack>
           </div>
         <IndexTable
           resourceName={{ singular: "order", plural: "orders" }}
-          itemCount={rows.length}
+          itemCount={filteredRows.length}
           selectable={false}
           headings={[
             { title: "Order" },
@@ -268,7 +357,7 @@ export default function Orders() {
             { title: "Status" },
           ]}
         >
-          {rows.map((r, index) => (
+          {filteredRows.map((r, index) => (
             <IndexTable.Row id={r.id} key={r.id} position={index}>
               <IndexTable.Cell>
                 <Text as="span" fontWeight="semibold">
@@ -379,23 +468,29 @@ export default function Orders() {
               </IndexTable.Cell>
               <IndexTable.Cell>
                 <BlockStack gap="150">
-                  {r.isRto ? (
-                    <Badge tone="critical" icon={ReturnIcon}>
-                      RTO
-                    </Badge>
-                  ) : r.isCancelled ? (
-                    <Badge tone="warning">Cancelled</Badge>
-                  ) : r.isCod && !r.isDelivered ? (
-                    r.isInTransit ? (
-                      <Badge tone="attention">In transit</Badge>
-                    ) : r.isDispatched ? (
-                      <Badge tone="attention">Fulfilled, awaiting courier</Badge>
-                    ) : (
-                      <Badge tone="attention">Awaiting fulfillment</Badge>
-                    )
-                  ) : (
-                    <Badge tone="success">Delivered/active</Badge>
-                  )}
+                  {(() => {
+                    // Same classification the status filter above uses —
+                    // one function, so the badge and the filter can never
+                    // silently drift apart from each other.
+                    switch (statusKeyFor(r)) {
+                      case "rto":
+                        return (
+                          <Badge tone="critical" icon={ReturnIcon}>
+                            RTO
+                          </Badge>
+                        );
+                      case "cancelled":
+                        return <Badge tone="warning">Cancelled</Badge>;
+                      case "in_transit":
+                        return <Badge tone="attention">In transit</Badge>;
+                      case "awaiting_courier":
+                        return <Badge tone="attention">Fulfilled, awaiting courier</Badge>;
+                      case "awaiting_fulfillment":
+                        return <Badge tone="attention">Awaiting fulfillment</Badge>;
+                      default:
+                        return <Badge tone="success">Delivered/active</Badge>;
+                    }
+                  })()}
                   {/* Side-by-side rather than stacked, so a row with both
                       the RTO and delivery toggles (any active COD order)
                       isn't visibly taller than a row with just one — keeps
