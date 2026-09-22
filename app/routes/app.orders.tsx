@@ -25,7 +25,11 @@ import {
 import { getCourierRateOverrides } from "../services/courierRates.server";
 import { StatCard, SectionHeading } from "../components/StatTile";
 
-const PAGE_DAYS = 30;
+const PAGE_DAYS = 60;
+// A generous safety ceiling, not a real-world expectation — matches the same
+// 2,000-order cap backfillRecentOrders uses for its own sync window, so this
+// list can never run further ahead of what's actually been synced in.
+const PAGE_ORDER_CAP = 2000;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -38,7 +42,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         createdAt: { gte: new Date(Date.now() - PAGE_DAYS * 24 * 60 * 60 * 1000) },
       },
       orderBy: { createdAt: "desc" },
-      take: 100,
+      take: PAGE_ORDER_CAP,
     }),
     getCostSettingsHistory(shop),
     prisma.productCost.findMany({ where: { shop } }),
