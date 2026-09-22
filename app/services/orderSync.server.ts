@@ -238,12 +238,28 @@ function computeIsRto({
   cancelReason,
   cancelledAt,
   fulfillmentStatus,
+  returnStatus,
 }: {
   tags?: string[] | string | null;
   cancelReason?: string | null;
   cancelledAt?: string | null;
   fulfillmentStatus?: string | null;
+  // Shopify's own aggregated Order.returnStatus (GraphQL-only — the backfill
+  // path passes this, the REST webhook path doesn't have it and always
+  // omits it, which is fine: the backfill reconciliation runs regularly
+  // enough to still catch it). This is the case a merchant's team creating
+  // a Shopify Return directly (e.g. after scanning a courier's "failed
+  // delivery" tracking update) used to fall through completely — it isn't
+  // a cancellation and doesn't necessarily carry any RTO_KEYWORDS tag, so
+  // neither check below ever caught it. Any status other than "NO_RETURN"
+  // means Shopify has a recorded Return against this order — for a COD
+  // store that basically only ever means the parcel came back undelivered,
+  // never a delivered-then-changed-their-mind return, so it's treated as
+  // RTO the same as the other signals here.
+  returnStatus?: string | null;
 }): boolean {
+  if (returnStatus && returnStatus !== "NO_RETURN") return true;
+
   if (cancelledAt && wasDispatched(fulfillmentStatus)) return true;
 
   // Independent of cancellation: a courier/fulfillment integration that
@@ -451,6 +467,7 @@ export async function backfillRecentOrders(
             displayFulfillmentStatus
             cancelledAt
             cancelReason
+            returnStatus
             tags
             sourceName
             paymentGatewayNames
@@ -608,6 +625,7 @@ export async function backfillRecentOrders(
       cancelReason: node.cancelReason,
       cancelledAt: node.cancelledAt,
       fulfillmentStatus: node.displayFulfillmentStatus,
+      returnStatus: node.returnStatus,
     });
     const cancelledAt = node.cancelledAt ? new Date(node.cancelledAt) : null;
     // Diagnostic: exactly what Shopify told us for this order and what we
@@ -615,7 +633,7 @@ export async function backfillRecentOrders(
     // name doesn't contain "cod"/"cash on delivery") is visible in Railway
     // logs immediately instead of requiring another guess-and-ship round.
     console.log(
-      `backfillRecentOrders: ${node.name} — gateways=${JSON.stringify(node.paymentGatewayNames)} financialStatus=${node.displayFinancialStatus} fulfillmentStatus=${node.displayFulfillmentStatus} -> isCod=${isCod}`,
+      `backfillRecentOrders: ${node.name} — gateways=${JSON.stringify(node.paymentGatewayNames)} financialStatus=${node.displayFinancialStatus} fulfillmentStatus=${node.displayFulfillmentStatus} returnStatus=${node.returnStatus} -> isCod=${isCod} isRto=${isRto}`,
     );
     // Authoritative — this is Shopify's real Fulfillment.deliveredAt
     // timestamp, not the webhook path's approximated "now". Take the
