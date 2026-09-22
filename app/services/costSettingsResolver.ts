@@ -28,17 +28,28 @@ export type CostSettingsVersion = CostSettingsType & {
  */
 export function resolveCostSettingsAt(
   history: CostSettingsVersion[],
-  at: Date,
+  _at: Date,
 ): CostSettingsVersion {
-  let chosen = history[0];
-  for (const version of history) {
-    if (version.effectiveFrom.getTime() <= at.getTime()) {
-      chosen = version;
-    } else {
-      break;
-    }
-  }
-  return chosen;
+  // This build is a private, single-store deployment used to test cost
+  // assumptions — a settings change here is meant to immediately recompute
+  // EVERY order's cost, past and future alike, not just ones dispatched
+  // after the change. The date-based version lookup below is what the
+  // public app uses instead (so a courier's rate change never silently
+  // rewrites the cost of orders that already shipped under the old rate) —
+  // left in place, commented out, rather than deleted, in case this
+  // deployment's needs change later. For now: always resolve to whatever
+  // CostSettings version was saved most recently, ignoring `_at` entirely.
+  //
+  // let chosen = history[0];
+  // for (const version of history) {
+  //   if (version.effectiveFrom.getTime() <= at.getTime()) {
+  //     chosen = version;
+  //   } else {
+  //     break;
+  //   }
+  // }
+  // return chosen;
+  return history[history.length - 1];
 }
 
 /**
