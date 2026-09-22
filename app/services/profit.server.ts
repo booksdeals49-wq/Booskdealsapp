@@ -179,8 +179,25 @@ function resolveUnitCost(
   return item.price * (defaultCogsPercent / 100);
 }
 
-function normalizeCourierName(name: string): string {
+// Exported so courierRates.server.ts's getUnmappedCouriers can apply the
+// exact same substring-tolerant matching rule as resolveDeliveryFee below
+// when deciding whether a detected courier already has a configured rate —
+// see that function's own comment for why this used to disagree with the
+// nudge banner (an exact match there, substring-tolerant here) and nag
+// about a courier ("Trax") that a configured rate ("Trax Courier") already
+// covered.
+export function normalizeCourierName(name: string): string {
   return name.trim().toLowerCase();
+}
+
+/** True if two courier names should be treated as the same courier — same
+ * case-insensitive, either-is-a-substring-of-the-other rule
+ * resolveDeliveryFee uses to match a detected courier against a configured
+ * rate. */
+export function courierNamesMatch(a: string, b: string): boolean {
+  const x = normalizeCourierName(a);
+  const y = normalizeCourierName(b);
+  return x.length > 0 && y.length > 0 && (x === y || x.includes(y) || y.includes(x));
 }
 
 /**

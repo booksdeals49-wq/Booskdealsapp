@@ -9,6 +9,7 @@
 // courier rates imports from one place.
 import prisma from "../db.server";
 import type { CourierRateOverride } from "./profit.server";
+import { courierNamesMatch } from "./profit.server";
 
 /** Every courier rate configured for a shop, alphabetical by name. */
 export async function getCourierRates(shop: string) {
@@ -66,10 +67,17 @@ export async function deleteCourierRate(shop: string, id: string) {
  * recent orders (OrderRecord.trackingCompany) that don't yet have a
  * configured rate — surfaced in Cost Settings as a nudge ("we detected
  * these couriers, add a cost for them") so a merchant can see the
- * auto-detection is genuinely working and knows what to add next. Matching
- * against configured rates is a simple case-insensitive exact check here
- * (not the fuzzier substring matching profit.server.ts's resolveDeliveryFee
- * uses) — good enough for a hint, not a billing-critical computation.
+ * auto-detection is genuinely working and knows what to add next.
+ *
+ * Matching against configured rates now uses the exact same
+ * substring-tolerant rule as profit.server.ts's resolveDeliveryFee
+ * (courierNamesMatch) — this used to be a stricter exact-only check, which
+ * meant a rate saved as "Trax Courier" never satisfied this banner's check
+ * for a detected "Trax", even though resolveDeliveryFee already matches
+ * them and correctly prices those orders. The banner kept nagging about an
+ * already-covered courier under a slightly different spelling. Now the two
+ * agree: if resolveDeliveryFee would apply a configured rate to an order
+ * from this courier, this no longer lists it as unmapped.
  */
 export async function getUnmappedCouriers(
   shop: string,
@@ -89,16 +97,15 @@ export async function getUnmappedCouriers(
     getCourierRates(shop),
   ]);
 
-  const configuredKeys = new Set(
-    rates.map((r: { courierName: string }) => courierKeyFor(r.courierName)),
-  );
+  const configuredNames = rates.map((r: { courierName: string }) => r.courierName);
   const seen = new Set<string>();
   const unmapped: string[] = [];
   for (const row of detected as Array<{ trackingCompany: string | null }>) {
     const name = row.trackingCompany;
     if (!name) continue;
     const key = courierKeyFor(name);
-    if (configuredKeys.has(key) || seen.has(key)) continue;
+    if (seen.has(key)) continue;
+    if (configuredNames.some((configured: string) => courierNamesMatch(name, configured))) continue;
     seen.add(key);
     unmapped.push(name);
   }

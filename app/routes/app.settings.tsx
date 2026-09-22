@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { useActionData, useLoaderData, useNavigation, useSubmit, Form } from "@remix-run/react";
@@ -16,6 +16,7 @@ import {
   Checkbox,
 } from "@shopify/polaris";
 import { SettingsIcon, DeliveryIcon, ReceiptDollarIcon } from "@shopify/polaris-icons";
+import { SaveBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { SectionHeading } from "../components/StatTile";
@@ -113,6 +114,35 @@ type FormState = {
   ecommerceTransactionTaxPercent: string;
 };
 
+// Shared by the loader's `settings` and the action's freshly-created
+// `settings` row (same Prisma CostSettings shape either way) — used both to
+// seed the form on first load and to re-baseline it after a successful save,
+// so the contextual save bar's dirty check (`form` vs `baseline`, below)
+// compares against whichever version is actually "current."
+function formStateFrom(s: {
+  currency: string;
+  defaultCogsPercent: number;
+  deliveryFeeFlat: number;
+  rtoFeeFlat: number;
+  cashHandlingPercent: number;
+  taxPercent: number;
+  packagingFeeFlat: number;
+  rtoRestockable: boolean;
+  ecommerceTransactionTaxPercent: number;
+}): FormState {
+  return {
+    currency: s.currency,
+    defaultCogsPercent: String(s.defaultCogsPercent),
+    deliveryFeeFlat: String(s.deliveryFeeFlat),
+    rtoFeeFlat: String(s.rtoFeeFlat),
+    cashHandlingPercent: String(s.cashHandlingPercent),
+    taxPercent: String(s.taxPercent),
+    packagingFeeFlat: String(s.packagingFeeFlat),
+    rtoRestockable: s.rtoRestockable,
+    ecommerceTransactionTaxPercent: String(s.ecommerceTransactionTaxPercent),
+  };
+}
+
 export default function Settings() {
   const { settings, versionCount, courierRates, unmappedCouriers } =
     useLoaderData<typeof loader>();
@@ -121,22 +151,41 @@ export default function Settings() {
   const submit = useSubmit();
   const saving = navigation.state === "submitting";
 
-  const [form, setForm] = useState<FormState>({
-    currency: settings.currency,
-    defaultCogsPercent: String(settings.defaultCogsPercent),
-    deliveryFeeFlat: String(settings.deliveryFeeFlat),
-    rtoFeeFlat: String(settings.rtoFeeFlat),
-    cashHandlingPercent: String(settings.cashHandlingPercent),
-    taxPercent: String(settings.taxPercent),
-    packagingFeeFlat: String(settings.packagingFeeFlat),
-    rtoRestockable: settings.rtoRestockable,
-    ecommerceTransactionTaxPercent: String(settings.ecommerceTransactionTaxPercent),
-  });
+  const [form, setForm] = useState<FormState>(() => formStateFrom(settings));
+  // The last-saved snapshot — what the save bar diffs the live `form`
+  // against to decide whether it's dirty. Only moves when a save of THIS
+  // form actually round-trips (see the effect below); it deliberately does
+  // NOT track the separate courier-rate form.
+  const [baseline, setBaseline] = useState<FormState>(() => formStateFrom(settings));
+  const isDirty = JSON.stringify(form) !== JSON.stringify(baseline);
+
+  // Re-baseline after a successful save so the save bar hides again — the
+  // loader's `settings` doesn't refresh on its own (this route doesn't
+  // redirect after a POST), so without this the bar would stay "dirty"
+  // forever after the very first save.
+  useEffect(() => {
+    if (actionData?.ok && "settings" in actionData) {
+      const next = formStateFrom(actionData.settings);
+      setForm(next);
+      setBaseline(next);
+    }
+  }, [actionData]);
 
   const set = (key: keyof FormState) => (value: string) =>
     setForm((f) => ({ ...f, [key]: value }));
 
+  const discardChanges = () => setForm(baseline);
+
   const [courierForm, setCourierForm] = useState({ name: "", cost: "" });
+  // Which existing courier rate (by id) the form below is currently
+  // editing, if any — null means the form is for adding a brand-new
+  // courier. Purely a UI affordance: upsertCourierRate already matched
+  // (and updated) an existing rate by name whenever the submitted name
+  // matched one, so "Edit" just pre-fills the form with that row's values
+  // instead of requiring the merchant to retype the courier's name exactly
+  // to update its cost.
+  const [editingCourierId, setEditingCourierId] = useState<string | null>(null);
+  const courierFormRef = useRef<HTMLDivElement>(null);
   // Clear the add-courier fields once a save round-trips successfully —
   // this component stays mounted across the Remix form POST (same route),
   // so without this the two fields would otherwise keep showing whatever
@@ -144,10 +193,23 @@ export default function Settings() {
   useEffect(() => {
     if (actionData && "courierSaved" in actionData && actionData.courierSaved) {
       setCourierForm({ name: "", cost: "" });
+      setEditingCourierId(null);
     }
   }, [actionData]);
 
+  const editCourier = (rate: { id: string; courierName: string; cost: number }) => {
+    setCourierForm({ name: rate.courierName, cost: String(rate.cost) });
+    setEditingCourierId(rate.id);
+    courierFormRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const cancelEditCourier = () => {
+    setCourierForm({ name: "", cost: "" });
+    setEditingCourierId(null);
+  };
+
   const deleteCourier = (id: string) => {
+    if (id === editingCourierId) cancelEditCourier();
     submit(
       { intent: "deleteCourierRate", courierRateId: id },
       { method: "post" },
@@ -156,6 +218,25 @@ export default function Settings() {
 
   return (
     <Page title="Cost Settings" subtitle="Used to compute true COD profit on every order">
+      {/* Sticky top-of-admin bar (Shopify's "Built for Shopify" design
+          guidelines require it) — shows only while the cost-model form below
+          differs from what's actually saved. Its Save button submits that
+          form via the `form` attribute rather than living inside it, since
+          App Bridge renders this into its own fixed position outside the
+          page's normal flow. */}
+      <SaveBar id="cost-settings-save-bar" open={isDirty} discardConfirmation>
+        <button
+          variant="primary"
+          type="submit"
+          form="cost-settings-form"
+          loading={saving}
+        >
+          Save settings
+        </button>
+        <button type="button" onClick={discardChanges} disabled={saving}>
+          Discard
+        </button>
+      </SaveBar>
       <BlockStack gap="400">
         {actionData?.ok && "settings" in actionData && (
           <Banner tone="success" title="Settings saved">
@@ -190,7 +271,7 @@ export default function Settings() {
             fee; only orders dispatched after use the new one.
           </p>
         </Banner>
-        <Form method="post">
+        <Form method="post" id="cost-settings-form">
           <input type="hidden" name="intent" value="saveCostSettings" />
           <BlockStack gap="400">
           <Card>
@@ -351,11 +432,24 @@ export default function Settings() {
                   <InlineStack key={rate.id} align="space-between" blockAlign="center">
                     <Text as="span" fontWeight="medium">
                       {rate.courierName}
+                      {rate.id === editingCourierId && (
+                        <Text as="span" tone="subdued">
+                          {" "}(editing)
+                        </Text>
+                      )}
                     </Text>
                     <InlineStack gap="300" blockAlign="center">
                       <Text as="span" tone="subdued">
                         {rate.cost.toFixed(2)} / order
                       </Text>
+                      <Button
+                        size="micro"
+                        variant="tertiary"
+                        onClick={() => editCourier(rate)}
+                        disabled={navigation.state === "submitting"}
+                      >
+                        Edit
+                      </Button>
                       <Button
                         size="micro"
                         tone="critical"
@@ -370,37 +464,53 @@ export default function Settings() {
                 ))}
               </BlockStack>
             )}
-            <Form method="post">
-              <input type="hidden" name="intent" value="addCourierRate" />
-              <FormLayout>
-                <FormLayout.Group>
-                  <TextField
-                    label="Courier name"
-                    name="courierName"
-                    autoComplete="off"
-                    placeholder="Enter the courier's name"
-                    value={courierForm.name}
-                    onChange={(value) =>
-                      setCourierForm((f) => ({ ...f, name: value }))
-                    }
-                  />
-                  <TextField
-                    label="Cost per order"
-                    name="courierCost"
-                    type="number"
-                    step={0.01}
-                    autoComplete="off"
-                    value={courierForm.cost}
-                    onChange={(value) =>
-                      setCourierForm((f) => ({ ...f, cost: value }))
-                    }
-                  />
-                </FormLayout.Group>
-                <Button submit loading={saving}>
-                  Add / update courier
-                </Button>
-              </FormLayout>
-            </Form>
+            <div ref={courierFormRef}>
+              <Form method="post">
+                <input type="hidden" name="intent" value="addCourierRate" />
+                <FormLayout>
+                  {editingCourierId && (
+                    <Text as="p" tone="subdued" variant="bodySm">
+                      Editing <Text as="span" fontWeight="semibold">{courierForm.name}</Text> — change the cost
+                      below and save.
+                    </Text>
+                  )}
+                  <FormLayout.Group>
+                    <TextField
+                      label="Courier name"
+                      name="courierName"
+                      autoComplete="off"
+                      placeholder="Enter the courier's name"
+                      value={courierForm.name}
+                      readOnly={Boolean(editingCourierId)}
+                      onChange={(value) =>
+                        setCourierForm((f) => ({ ...f, name: value }))
+                      }
+                    />
+                    <TextField
+                      label="Cost per order"
+                      name="courierCost"
+                      type="number"
+                      step={0.01}
+                      autoComplete="off"
+                      value={courierForm.cost}
+                      onChange={(value) =>
+                        setCourierForm((f) => ({ ...f, cost: value }))
+                      }
+                    />
+                  </FormLayout.Group>
+                  <InlineStack gap="200">
+                    <Button submit loading={saving} variant="primary">
+                      {editingCourierId ? `Save ${courierForm.name}` : "Add / update courier"}
+                    </Button>
+                    {editingCourierId && (
+                      <Button onClick={cancelEditCourier} disabled={saving}>
+                        Cancel
+                      </Button>
+                    )}
+                  </InlineStack>
+                </FormLayout>
+              </Form>
+            </div>
             <Text as="p" tone="subdued" variant="bodySm">
               Saving a courier name that already exists updates its cost —
               matching is case-insensitive, so different capitalizations of
