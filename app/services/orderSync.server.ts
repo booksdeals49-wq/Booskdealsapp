@@ -423,6 +423,13 @@ export async function syncOrderFromPayload(
  * Backfill recent orders for a shop right after install via the Admin
  * GraphQL API, so the dashboard isn't empty until new webhooks arrive.
  * Call this from the app._index loader on first load, or a background job.
+ *
+ * Paginates through every page of orders in the window rather than taking
+ * only the first 100 — a single `first: 100` page silently dropped any
+ * order past the 100 most-recent ones whenever a shop had more than that
+ * many in the lookback window. Capped at MAX_PAGES so a pathological shop
+ * (or a bug) can't turn this into an unbounded loop on every single
+ * Dashboard load — this reconciles on every load, see the call site.
  */
 export async function backfillRecentOrders(
   admin: { graphql: (query: string, opts?: any) => Promise<Response> },
@@ -431,12 +438,10 @@ export async function backfillRecentOrders(
 ) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-  let response: Response;
-  try {
-    response = await admin.graphql(
-      `#graphql
-    query BackfillOrders($query: String!) {
-      orders(first: 100, query: $query, sortKey: CREATED_AT, reverse: true) {
+  const QUERY = `#graphql
+    query BackfillOrders($query: String!, $cursor: String) {
+      orders(first: 100, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: true) {
+        pageInfo { hasNextPage endCursor }
         edges {
           node {
             id
@@ -478,68 +483,89 @@ export async function backfillRecentOrders(
           }
         }
       }
-    }`,
-      // No status: filter here on purpose — the GraphQL orders query has no
-      // default status restriction when it's omitted entirely, so this
-      // already returns orders of every status (open, closed, cancelled).
-      // "status:any" is NOT valid syntax here (that's a REST-API-only
-      // convention) — including it made Shopify reject the whole query.
-      { variables: { query: `created_at:>=${since}` } },
-    );
-  } catch (err: any) {
-    // Log the full GraphQL error detail (Shopify's client throws on any
-    // GraphQL-level "errors" array, even with HTTP 200) so it's actually
-    // visible in Railway logs instead of collapsing to "[Array]" / a bare
-    // "Unexpected Server Error". Then fail soft: an empty backfill just
-    // means the dashboard stays empty until webhooks arrive, rather than
-    // crashing the whole page.
-    // Now confirmed: what gets thrown here is a raw, un-read fetch Response
-    // (status/statusText/headers, body still an unread ReadableStream) —
-    // not an Error and not a pre-parsed Shopify error class. Every earlier
-    // attempt to read err.message / err.response.errors / etc. came back
-    // empty because those properties genuinely don't exist on a Response.
-    // The real error text from Shopify is sitting unread in the body, so
-    // read that directly.
-    if (err instanceof Response) {
-      let bodyText = "(could not read response body)";
-      try {
-        bodyText = await err.text();
-      } catch (readErr) {
-        bodyText = `(reading body threw: ${String(readErr)})`;
+    }`;
+
+  // Far more than a "recent backfill" pass is meant to cover — 20 × 100 =
+  // 2,000 orders in the window before this stops paginating further.
+  const MAX_PAGES = 20;
+  const allEdges: any[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  let pageNum = 0;
+
+  while (hasNextPage && pageNum < MAX_PAGES) {
+    pageNum++;
+    let response: Response;
+    try {
+      response = await admin.graphql(QUERY, {
+        // No status: filter here on purpose — the GraphQL orders query has no
+        // default status restriction when it's omitted entirely, so this
+        // already returns orders of every status (open, closed, cancelled).
+        // "status:any" is NOT valid syntax here (that's a REST-API-only
+        // convention) — including it made Shopify reject the whole query.
+        variables: { query: `created_at:>=${since}`, cursor },
+      });
+    } catch (err: any) {
+      // Log the full GraphQL error detail (Shopify's client throws on any
+      // GraphQL-level "errors" array, even with HTTP 200) so it's actually
+      // visible in Railway logs instead of collapsing to "[Array]" / a bare
+      // "Unexpected Server Error". Then fail soft on just THIS page: any
+      // orders already collected from earlier pages still get processed
+      // below, instead of throwing the whole backfill away.
+      // Now confirmed: what gets thrown here is a raw, un-read fetch Response
+      // (status/statusText/headers, body still an unread ReadableStream) —
+      // not an Error and not a pre-parsed Shopify error class. Every earlier
+      // attempt to read err.message / err.response.errors / etc. came back
+      // empty because those properties genuinely don't exist on a Response.
+      // The real error text from Shopify is sitting unread in the body, so
+      // read that directly.
+      if (err instanceof Response) {
+        let bodyText = "(could not read response body)";
+        try {
+          bodyText = await err.text();
+        } catch (readErr) {
+          bodyText = `(reading body threw: ${String(readErr)})`;
+        }
+        console.error(
+          `backfillRecentOrders: BackfillOrders request failed (page ${pageNum}) — HTTP ${err.status} ${err.statusText} — body: ${bodyText}`,
+        );
+      } else {
+        // Fallback for any other shape, in case it's ever something else.
+        console.error(
+          `backfillRecentOrders: BackfillOrders query failed (page ${pageNum}) — raw error object follows:`,
+        );
+        console.error(err);
       }
-      console.error(
-        `backfillRecentOrders: BackfillOrders request failed — HTTP ${err.status} ${err.statusText} — body: ${bodyText}`,
-      );
-      return 0;
+      break;
     }
-    // Fallback for any other shape, in case it's ever something else.
-    console.error("backfillRecentOrders: BackfillOrders query failed — raw error object follows:");
-    console.error(err);
-    return 0;
-  }
 
-  const json = await response.json();
-  const edges = json?.data?.orders?.edges ?? [];
+    const json = await response.json();
+    if (json?.errors) {
+      console.error(
+        `backfillRecentOrders: BackfillOrders returned GraphQL errors (page ${pageNum}) —`,
+        JSON.stringify(json.errors, null, 2),
+      );
+    }
+    const pageEdges = json?.data?.orders?.edges ?? [];
+    allEdges.push(...pageEdges);
 
-  if (json?.errors) {
-    console.error(
-      "backfillRecentOrders: BackfillOrders returned GraphQL errors —",
-      JSON.stringify(json.errors, null, 2),
-    );
+    const pageInfo = json?.data?.orders?.pageInfo;
+    hasNextPage = Boolean(pageInfo?.hasNextPage);
+    cursor = pageInfo?.endCursor ?? null;
   }
 
   // Always log the raw count, success or not — otherwise a clean run with
   // zero results looks identical to a clean run with the expected results,
   // and there's no way to tell them apart from Railway logs alone.
   console.log(
-    `backfillRecentOrders: found ${edges.length} order(s) from Shopify since ${since} — ${edges.map((e: any) => e.node.name).join(", ") || "(none)"}`,
+    `backfillRecentOrders: found ${allEdges.length} order(s) across ${pageNum} page(s) from Shopify since ${since} — ${allEdges.map((e: any) => e.node.name).join(", ") || "(none)"}`,
   );
 
   // Batched pre-fetch of each order's already-recorded line items, so the
   // shopifyUnitCost merge below (preserveKnownLineItemCosts) doesn't need
   // an extra DB round-trip per order inside the loop.
   const existingRecords = await prisma.orderRecord.findMany({
-    where: { shop, orderId: { in: edges.map((e: any) => e.node.id) } },
+    where: { shop, orderId: { in: allEdges.map((e: any) => e.node.id) } },
     select: { orderId: true, lineItemsJson: true },
   });
   const existingLineItemsByOrderId = new Map<string, string | null>(
@@ -548,7 +574,7 @@ export async function backfillRecentOrders(
     ),
   );
 
-  for (const { node } of edges) {
+  for (const { node } of allEdges) {
     const freshLineItems: LineItem[] = node.lineItems.edges.map((e: any) => ({
       variantId: e.node.variant?.id ?? "",
       productId: e.node.product?.id ?? "",
@@ -716,5 +742,5 @@ export async function backfillRecentOrders(
     });
   }
 
-  return edges.length;
+  return allEdges.length;
 }

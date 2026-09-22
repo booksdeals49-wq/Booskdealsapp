@@ -33,8 +33,14 @@ export async function getBillingState(shop: string) {
 }
 
 export function currentTier(state: { plan: string; status: string }): Tier {
-  if (state.status === "active") return state.plan as Tier;
-  return "free";
+  // This build is a private, custom-distribution copy running on a single
+  // store its owner controls — not the public-listed app. Custom-distribution
+  // apps can't use Shopify's Billing API at all (Shopify blocks it outright),
+  // so the paid-plan upgrade flow below is a dead end on this deployment
+  // regardless — there's no way to ever leave Free through the normal path.
+  // Always report the top tier here so nothing is capped or gated behind it.
+  void state;
+  return "pro";
 }
 
 export function isOverFreeLimit(state: { orderCount: number }) {
@@ -99,7 +105,7 @@ export async function createSubscription(
     }`,
     {
       variables: {
-        name: `cod-profit-app — ${plan.name}${isAnnual ? " (annual)" : ""}`,
+        name: `True COD Profit — ${plan.name}${isAnnual ? " (annual)" : ""}`,
         returnUrl: `${appUrl}/app/billing`,
         test: isTestCharge(),
         price: price.toFixed(2),

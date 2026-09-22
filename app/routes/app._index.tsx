@@ -60,6 +60,13 @@ import { BRAND } from "../components/theme";
 
 const DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Deliberately separate from DAYS above: DAYS drives what the Dashboard
+// itself displays/aggregates (stat cards, trend chart, the "vs previous
+// period" comparison window) — widening THAT changes what merchants see by
+// default. This constant only controls how far back backfillRecentOrders
+// looks when reconciling with Shopify, so older orders actually get pulled
+// in and stored without changing the Dashboard's own 30-day display window.
+const BACKFILL_DAYS = 60;
 
 // Each stat card links to the page that explains it, colored by
 // destination — not by whether the number is good or bad, that's what the
@@ -209,7 +216,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // upserts (skip-if-exists on the create branch), so calling this on every
   // load is safe — it's just a small amount of extra Shopify API traffic to
   // guarantee nothing silently falls through the cracks.
-  await backfillRecentOrders(admin, shop, DAYS);
+  await backfillRecentOrders(admin, shop, BACKFILL_DAYS);
 
   const orders = await prisma.orderRecord.findMany({
     where: {
