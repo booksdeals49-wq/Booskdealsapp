@@ -35,6 +35,7 @@ import {
   computeRoas,
 } from "../services/profit.server";
 import { backfillRecentOrders, wasDispatched } from "../services/orderSync.server";
+import { isBackfillDue, markBackfillRan } from "../services/billing.server";
 import {
   getCostSettingsHistory,
   resolveCostSettingsAt,
@@ -212,16 +213,29 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // already provides for order data.
   await registerWebhooks({ session });
 
-  // Reconcile with Shopify on every Dashboard load, not just when the local
-  // database is empty. This used to be gated behind `orders.length === 0`
-  // ("first-run convenience"), which meant it only ever ran once per shop —
-  // after that, the dashboard relied entirely on webhooks to stay current,
+  // Reconcile with Shopify on Dashboard load, not just when the local
+  // database is empty — this used to be gated behind `orders.length === 0`
+  // ("first-run convenience"), which meant it only ever ran once per shop,
+  // after which the dashboard relied entirely on webhooks to stay current,
   // and any missed/failed webhook delivery meant an order would never show
   // up no matter how many times the page was reloaded. syncOrderFromPayload
-  // upserts (skip-if-exists on the create branch), so calling this on every
-  // load is safe — it's just a small amount of extra Shopify API traffic to
-  // guarantee nothing silently falls through the cracks.
-  await backfillRecentOrders(admin, shop, BACKFILL_DAYS);
+  // upserts (skip-if-exists on the create branch), so calling this is safe
+  // to repeat.
+  //
+  // It's throttled to once every few minutes (isBackfillDue/markBackfillRan
+  // in billing.server.ts) rather than run on every single load, though —
+  // with the wider 90-day/3,000-order backfill window this app now uses,
+  // a full pass is up to ~30 sequential paginated Shopify API calls plus a
+  // few thousand Prisma upserts, and running all of that before the page can
+  // even start rendering is what was making the Dashboard slow. Orders,
+  // Reports and Ad Spend don't have this problem because they only ever read
+  // the already-synced local database and never call Shopify directly. Once
+  // the throttle window has passed since the last run, the very next load
+  // pays that cost once and resets the window.
+  if (await isBackfillDue(shop)) {
+    await backfillRecentOrders(admin, shop, BACKFILL_DAYS);
+    await markBackfillRan(shop);
+  }
 
   const orders = await prisma.orderRecord.findMany({
     where: {

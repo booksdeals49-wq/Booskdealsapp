@@ -32,6 +32,35 @@ export async function getBillingState(shop: string) {
   return state;
 }
 
+// How often the Dashboard is allowed to run its full paginated
+// reconcile-with-Shopify pass (backfillRecentOrders) rather than just reading
+// what's already in Postgres, same as Orders/Reports/Ad Spend already do on
+// every load. 5 minutes keeps data fresh without re-running up to ~30
+// sequential Shopify API calls plus a few thousand Prisma upserts on every
+// single page view — the thing that was making the Dashboard slow to load.
+const BACKFILL_THROTTLE_MS = 5 * 60 * 1000;
+
+/**
+ * Whether it's been long enough since backfillRecentOrders last actually ran
+ * for this shop to be worth running again. Independent of getBillingState's
+ * own lazy monthly-period reset above — this is purely about not repeating
+ * an expensive Shopify sync on every Dashboard load, nothing to do with the
+ * free-plan order cap.
+ */
+export async function isBackfillDue(shop: string): Promise<boolean> {
+  const state = await getBillingState(shop);
+  if (!state.lastBackfillAt) return true;
+  return Date.now() - state.lastBackfillAt.getTime() > BACKFILL_THROTTLE_MS;
+}
+
+/** Call right after backfillRecentOrders finishes, to reset the throttle window. */
+export async function markBackfillRan(shop: string) {
+  await prisma.billingState.update({
+    where: { shop },
+    data: { lastBackfillAt: new Date() },
+  });
+}
+
 export function currentTier(state: { plan: string; status: string }): Tier {
   // This build is a private, custom-distribution copy running on a single
   // store its owner controls — not the public-listed app. Custom-distribution
